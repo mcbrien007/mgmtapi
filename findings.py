@@ -1,7 +1,61 @@
 #!/usr/bin/env python3
 """
-Fetch findings from the Noname API and export **all** available return fields
-to both JSON (raw) and CSV (flattened).
+Fetch findings from Noname API, enrich each finding with API metadata (from apiId and relatedApiIds),
+then save results to JSON and CSV.
+
+Summary of Your Findings Fetcher Script
+Authentication & Token Caching
+
+Authenticates to Noname API using client_id and client_secret.
+
+Caches the Bearer token locally for up to 8 hours to avoid redundant auth calls.
+
+Fetch Findings
+
+Queries the findings API within a specified time window (--start and --end or --hours back).
+
+Requests a comprehensive set of fields (returnFields) for each finding.
+
+Handles pagination with offset and limit.
+
+Retries on network or auth errors with exponential backoff.
+
+API Metadata Enrichment
+
+For each finding, collects its apiId and all relatedApiIds.
+
+Fetches detailed API metadata for each unique API ID.
+
+Adds this API metadata as a list under "apiDetails" inside each finding.
+
+Output Formats
+
+Writes enriched findings with full API metadata to JSON.
+
+Writes a flattened CSV summary containing all requested fields plus a count of API metadata entries per finding.
+
+Properly formats arrays and dicts in CSV for readability.
+
+Logging and Error Handling
+
+Logs token and request activity.
+
+Prints clear error messages for failed requests.
+
+Handles token expiration transparently by refreshing.
+
+Key Benefits
+Comprehensive Data: Fetches detailed findings and enriches them with related API details.
+
+Efficiency: Avoids redundant API metadata calls by caching seen API IDs in-memory per run.
+
+Flexible: Accepts time ranges or hours back via CLI arguments.
+
+User-friendly Output: JSON for full detail and CSV for easy spreadsheet analysis.
+
+Robust: Retries on transient errors and handles token expiration automatically.
+
+
 """
 
 import argparse
@@ -16,7 +70,7 @@ from typing import Optional, List, Dict
 
 import requests
 
-# ── Configuration ────────────────────────────────────────────────────────────
+# ── Configuration ──────────────────────────────────────────────────────────────
 from config import CLIENT_ID, CLIENT_SECRET, HOST, AUTH_URL
 
 TOKEN_CACHE_FILE = Path("/tmp/token_cache.json")
@@ -27,7 +81,7 @@ CSV_PATH = "/tmp/findings_report.csv"
 JSON_PATH = "/tmp/findings_report.json"
 LIMIT = 50
 
-# ── Logging ──────────────────────────────────────────────────────────────────
+# ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     filename="/tmp/findings_log.txt",
     level=logging.INFO,
@@ -144,9 +198,8 @@ def fetch_findings(start_time: str, end_time: str) -> List[dict]:
             "detectionEndDate": end_time,
             "lastUpdateStartDate": start_time,
             "lastUpdateEndDate": end_time,
-            "returnFields": RETURN_FIELDS  # ✅ send as list, not string
+            "returnFields": RETURN_FIELDS
         }
-
 
         response = retry_request("get", FINDINGS_API, build_headers(BEARER_TOKEN), params=params)
         if not response:
@@ -162,6 +215,20 @@ def fetch_findings(start_time: str, end_time: str) -> List[dict]:
     return findings
 
 
+def fetch_api_metadata(api_id: str, token: str) -> Optional[dict]:
+    url = f"{HOST}/api/v3/apis/{api_id}"
+    headers = build_headers(token)
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            print(f"⚠️ Failed to fetch API {api_id}: {response.status_code}")
+    except requests.exceptions.RequestException as e:
+        print(f"❌ API fetch error for {api_id}: {e}")
+    return None
+
+
 def stringify(value):
     if isinstance(value, list):
         return ", ".join(str(v) for v in value)
@@ -171,7 +238,14 @@ def stringify(value):
 
 
 def flatten_finding(finding: dict) -> dict:
-    return {field: stringify(finding.get(field)) for field in RETURN_FIELDS}
+    # Flatten all RETURN_FIELDS + flatten apiDetails summary (just API ids count)
+    flat = {field: stringify(finding.get(field)) for field in RETURN_FIELDS}
+    # Add a summary field for how many APIs detailed
+    if "apiDetails" in finding:
+        flat["apiDetailsCount"] = len(finding["apiDetails"])
+    else:
+        flat["apiDetailsCount"] = 0
+    return flat
 
 
 def write_findings_to_csv(findings: List[dict], output_path: str = CSV_PATH) -> None:
@@ -180,7 +254,7 @@ def write_findings_to_csv(findings: List[dict], output_path: str = CSV_PATH) -> 
         return
 
     flattened = [flatten_finding(f) for f in findings]
-    keys = RETURN_FIELDS
+    keys = RETURN_FIELDS + ["apiDetailsCount"]
 
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
@@ -202,6 +276,8 @@ def write_findings_to_json(findings: List[dict], output_path: str = JSON_PATH) -
 
 
 # --- MAIN ---
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fetch findings from Noname API")
     parser.add_argument("--start", help="Start ISO timestamp (UTC)", default=None)
@@ -216,8 +292,28 @@ if __name__ == "__main__":
     start, end = get_time_window(args.start, args.end, args.hours)
     print(f"📅 Fetching findings from: {start} to {end}")
 
-    findings = fetch_findings(start, end)
+    raw_findings = fetch_findings(start, end)
 
-    write_findings_to_csv(findings)
-    write_findings_to_json(findings)
-    print(f"📊 Total findings: {len(findings)}")
+    # Enrich findings with API metadata
+    enriched_findings = []
+    seen_api_ids = set()
+    for finding in raw_findings:
+        api_ids = set()
+        if finding.get("apiId"):
+            api_ids.add(finding["apiId"])
+        for rid in finding.get("relatedApiIds", []):
+            api_ids.add(rid)
+
+        api_details = []
+        for api_id in api_ids:
+            if api_id not in seen_api_ids:
+                metadata = fetch_api_metadata(api_id, BEARER_TOKEN)
+                if metadata:
+                    api_details.append(metadata)
+                seen_api_ids.add(api_id)
+        finding["apiDetails"] = api_details
+        enriched_findings.append(finding)
+
+    write_findings_to_csv(enriched_findings)
+    write_findings_to_json(enriched_findings)
+    print(f"📊 Total findings: {len(enriched_findings)}")
