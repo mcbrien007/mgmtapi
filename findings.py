@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Fetch findings from Noname API, enrich each finding with API metadata (from apiId and relatedApiIds),
+
+Fetch findings from Noname API, optionally enrich each finding with API metadata (from apiId and relatedApiIds),
 then save results to JSON and CSV.
 
 Summary of Your Findings Fetcher Script
@@ -276,13 +277,17 @@ def write_findings_to_json(findings: List[dict], output_path: str = JSON_PATH) -
 
 
 # --- MAIN ---
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fetch findings from Noname API")
     parser.add_argument("--start", help="Start ISO timestamp (UTC)", default=None)
     parser.add_argument("--end", help="End ISO timestamp (UTC)", default=None)
     parser.add_argument("--hours", help="Hours back if no start/end", type=int, default=24)
+    parser.add_argument(
+        "--include-api-metadata",
+        help="Include API metadata enrichment",
+        action="store_true",
+        default=False,
+    )
     args = parser.parse_args()
 
     BEARER_TOKEN = get_bearer_token()
@@ -294,26 +299,30 @@ if __name__ == "__main__":
 
     raw_findings = fetch_findings(start, end)
 
-    # Enrich findings with API metadata
-    enriched_findings = []
-    seen_api_ids = set()
-    for finding in raw_findings:
-        api_ids = set()
-        if finding.get("apiId"):
-            api_ids.add(finding["apiId"])
-        for rid in finding.get("relatedApiIds", []):
-            api_ids.add(rid)
+    if args.include_api_metadata:
+        enriched_findings = []
+        seen_api_ids = set()
+        for finding in raw_findings:
+            api_ids = set()
+            if finding.get("apiId"):
+                api_ids.add(finding["apiId"])
+            for rid in finding.get("relatedApiIds", []):
+                api_ids.add(rid)
 
-        api_details = []
-        for api_id in api_ids:
-            if api_id not in seen_api_ids:
-                metadata = fetch_api_metadata(api_id, BEARER_TOKEN)
-                if metadata:
-                    api_details.append(metadata)
-                seen_api_ids.add(api_id)
-        finding["apiDetails"] = api_details
-        enriched_findings.append(finding)
+            api_details = []
+            for api_id in api_ids:
+                if api_id not in seen_api_ids:
+                    metadata = fetch_api_metadata(api_id, BEARER_TOKEN)
+                    if metadata:
+                        api_details.append(metadata)
+                    seen_api_ids.add(api_id)
+            finding["apiDetails"] = api_details
+            enriched_findings.append(finding)
 
-    write_findings_to_csv(enriched_findings)
-    write_findings_to_json(enriched_findings)
-    print(f"📊 Total findings: {len(enriched_findings)}")
+        output_findings = enriched_findings
+    else:
+        output_findings = raw_findings
+
+    write_findings_to_csv(output_findings)
+    write_findings_to_json(output_findings)
+    print(f"📊 Total findings: {len(output_findings)}")
