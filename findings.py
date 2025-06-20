@@ -1,52 +1,75 @@
+#!/usr/bin/env python3
+"""
+Fetch findings from the Noname API and export **all** available return fields
+to both JSON (raw) and CSV (flattened).
+"""
+
 import argparse
 import csv
 import json
 import logging
-import time
 import random
-import requests
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional, List, Dict
+
+import requests
+
+# ── Configuration ────────────────────────────────────────────────────────────
 from config import CLIENT_ID, CLIENT_SECRET, HOST, AUTH_URL
 
-# --- Constants ---
 TOKEN_CACHE_FILE = Path("/tmp/token_cache.json")
 TOKEN_EXPIRY_HOURS = 8
+
 FINDINGS_API = f"{HOST}/api/v4/findings"
 CSV_PATH = "/tmp/findings_report.csv"
 JSON_PATH = "/tmp/findings_report.json"
 LIMIT = 50
 
-# --- Logging setup ---
-logging.basicConfig(filename="/tmp/findings_log.txt", level=logging.INFO, format='%(asctime)s - %(message)s')
+# ── Logging ──────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    filename="/tmp/findings_log.txt",
+    level=logging.INFO,
+    format="%(asctime)s - %(message)s",
+)
+
+RETURN_FIELDS = [
+    "id", "title", "url", "typeId", "apiId", "module", "host", "path", "method",
+    "resourceGroupName", "status", "severity", "owaspTags", "complianceFrameworkTags",
+    "vulnerabilityFrameworkTags", "detectionTime", "lastUpdate", "triggeredOn",
+    "description", "impact", "remediation", "investigate", "comments", "tickets",
+    "externalTickets", "evidence", "source", "hasRelatedIncidents", "tagsIds",
+    "relatedApiIds"
+]
 
 
-def get_cached_token():
+def get_cached_token() -> Optional[str]:
     if TOKEN_CACHE_FILE.exists():
-        with open(TOKEN_CACHE_FILE, "r") as f:
-            try:
+        try:
+            with TOKEN_CACHE_FILE.open("r") as f:
                 data = json.load(f)
-                token = data.get("accessToken")
-                timestamp = data.get("timestamp")
-                if token and timestamp:
-                    token_time = datetime.fromisoformat(timestamp)
-                    if datetime.now(timezone.utc) - token_time < timedelta(hours=TOKEN_EXPIRY_HOURS):
-                        print("🔐 Using cached token.")
-                        return token
-            except (json.JSONDecodeError, ValueError):
-                print("⚠️ Failed to parse cached token.")
+            token = data.get("accessToken")
+            timestamp = data.get("timestamp")
+            if token and timestamp:
+                token_time = datetime.fromisoformat(timestamp)
+                if datetime.now(timezone.utc) - token_time < timedelta(hours=TOKEN_EXPIRY_HOURS):
+                    print("🔐 Using cached token.")
+                    return token
+        except (json.JSONDecodeError, ValueError):
+            print("⚠️ Failed to parse cached token.")
     return None
 
 
-def cache_token(token):
-    with open(TOKEN_CACHE_FILE, "w") as f:
+def cache_token(token: str) -> None:
+    with TOKEN_CACHE_FILE.open("w") as f:
         json.dump({
             "accessToken": token,
             "timestamp": datetime.now(timezone.utc).isoformat()
         }, f)
 
 
-def get_bearer_token(force_refresh=False):
+def get_bearer_token(force_refresh: bool = False) -> Optional[str]:
     if not force_refresh:
         cached = get_cached_token()
         if cached:
@@ -70,7 +93,7 @@ def get_bearer_token(force_refresh=False):
     return None
 
 
-def build_headers(token):
+def build_headers(token: str) -> Dict[str, str]:
     return {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
@@ -78,12 +101,12 @@ def build_headers(token):
     }
 
 
-def retry_request(method, url, headers, params=None, retries=5):
+def retry_request(method: str, url: str, headers: dict, params: Optional[dict] = None, retries: int = 5) -> Optional[requests.Response]:
     global BEARER_TOKEN
     for attempt in range(retries):
         try:
             response = getattr(requests, method)(url, headers=headers, params=params)
-            if response.status_code in [200]:
+            if response.status_code == 200:
                 return response
             elif response.status_code == 401:
                 print("🔁 Token expired. Refreshing.")
@@ -99,7 +122,7 @@ def retry_request(method, url, headers, params=None, retries=5):
     return None
 
 
-def get_time_window(start_arg, end_arg, hours_back=24):
+def get_time_window(start_arg: Optional[str], end_arg: Optional[str], hours_back: int = 24):
     now = datetime.now(timezone.utc)
     if start_arg and end_arg:
         return start_arg, end_arg
@@ -108,18 +131,9 @@ def get_time_window(start_arg, end_arg, hours_back=24):
     return start_time.isoformat(), end_time.isoformat()
 
 
-def fetch_findings(start_time, end_time):
+def fetch_findings(start_time: str, end_time: str) -> List[dict]:
     findings = []
     offset = 0
-
-    return_fields = [
-        "id", "title", "url", "typeId", "apiId", "module", "host", "path", "method",
-        "resourceGroupName", "status", "severity", "owaspTags", "complianceFrameworkTags",
-        "vulnerabilityFrameworkTags", "detectionTime", "lastUpdate", "triggeredOn",
-        "description", "impact", "remediation", "investigate", "comments", "tickets",
-        "externalTickets", "evidence", "source", "hasRelatedIncidents", "tagsIds",
-        "relatedApiIds"
-    ]
 
     while True:
         params = {
@@ -129,10 +143,10 @@ def fetch_findings(start_time, end_time):
             "detectionStartDate": start_time,
             "detectionEndDate": end_time,
             "lastUpdateStartDate": start_time,
-            "lastUpdateEndDate": end_time
+            "lastUpdateEndDate": end_time,
+            "returnFields": RETURN_FIELDS  # ✅ send as list, not string
         }
-        for field in return_fields:
-            params["returnFields"] = params.get("returnFields", []) + [field]
+
 
         response = retry_request("get", FINDINGS_API, build_headers(BEARER_TOKEN), params=params)
         if not response:
@@ -148,41 +162,35 @@ def fetch_findings(start_time, end_time):
     return findings
 
 
-def flatten_finding(finding):
-    return {
-        "id": finding.get("id"),
-        "title": finding.get("title"),
-        "url": finding.get("url"),
-        "severity": finding.get("severity"),
-        "status": finding.get("status"),
-        "host": finding.get("host"),
-        "path": finding.get("path"),
-        "method": finding.get("method"),
-        "detectionTime": finding.get("detectionTime"),
-        "lastUpdate": finding.get("lastUpdate"),
-        "source": ", ".join(finding.get("source", [])),
-        "owaspTags": ", ".join(finding.get("owaspTags", [])),
-        "typeId": finding.get("typeId")
-    }
+def stringify(value):
+    if isinstance(value, list):
+        return ", ".join(str(v) for v in value)
+    elif isinstance(value, dict):
+        return json.dumps(value)
+    return value
 
 
-def write_findings_to_csv(findings, output_path=CSV_PATH):
+def flatten_finding(finding: dict) -> dict:
+    return {field: stringify(finding.get(field)) for field in RETURN_FIELDS}
+
+
+def write_findings_to_csv(findings: List[dict], output_path: str = CSV_PATH) -> None:
     if not findings:
         print("⚠️ No findings to write to CSV.")
         return
 
     flattened = [flatten_finding(f) for f in findings]
-    keys = flattened[0].keys()
+    keys = RETURN_FIELDS
 
     with open(output_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=keys)
+        writer = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(flattened)
 
     print(f"✅ CSV written to: {output_path}")
 
 
-def write_findings_to_json(findings, output_path=JSON_PATH):
+def write_findings_to_json(findings: List[dict], output_path: str = JSON_PATH) -> None:
     if not findings:
         print("⚠️ No findings to write to JSON.")
         return
